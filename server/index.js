@@ -7,10 +7,12 @@ const dotenv = require("dotenv");
 dotenv.config();
 
 const PORT = Number(process.env.PORT) || 4000;
+const HOST = process.env.HOST || "0.0.0.0";
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
 const allowedOrigins = CLIENT_ORIGIN.split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+const allowAnyOrigin = allowedOrigins.includes("*");
 
 function corsOrigin(origin, callback) {
   // Allow non-browser tools or same-origin requests with no Origin header.
@@ -19,7 +21,7 @@ function corsOrigin(origin, callback) {
     return;
   }
 
-  if (allowedOrigins.includes(origin)) {
+  if (allowAnyOrigin || allowedOrigins.includes(origin)) {
     callback(null, true);
     return;
   }
@@ -232,6 +234,6 @@ io.on("connection", (socket) => {
   });
 });
 
-httpServer.listen(PORT, () => {
-  console.log(`Signaling server listening on http://localhost:${PORT}`);
+httpServer.listen(PORT, HOST, () => {
+  console.log(`Signaling server listening on http://${HOST}:${PORT}`);
 });

@@ -35,7 +35,13 @@ interface SignalingAck {
   message?: string;
 }
 
-const SIGNALING_URL = import.meta.env.VITE_SIGNALING_URL || "http://localhost:4000";
+const configuredSignalingUrl = (import.meta.env.VITE_SIGNALING_URL || "").trim();
+const isLocalBrowser = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+const configuredUsesLoopback = configuredSignalingUrl.includes("localhost") || configuredSignalingUrl.includes("127.0.0.1");
+const hostBasedSignalingUrl = `${window.location.protocol}//${window.location.hostname}:4000`;
+const SIGNALING_URL = configuredSignalingUrl
+  ? (!isLocalBrowser && configuredUsesLoopback ? hostBasedSignalingUrl : configuredSignalingUrl)
+  : hostBasedSignalingUrl;
 
 function App() {
   const socketRef = useRef<Socket | null>(null);
