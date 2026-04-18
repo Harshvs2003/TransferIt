@@ -1,0 +1,61 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply m-0 min-h-screen bg-slate-950 text-slate-100 font-sans;
+    background-image:
+      radial-gradient(circle at 20% 20%, rgba(255, 127, 14, 0.22), transparent 42%),
+      radial-gradient(circle at 78% 15%, rgba(29, 163, 155, 0.2), transparent 46%),
+      linear-gradient(160deg, #020617 0%, #0f172a 55%, #11273a 100%);
+  }
+
+  #root {
+    @apply min-h-screen;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply rounded-2xl border border-white/15 bg-slate-900/60 p-5 shadow-glow backdrop-blur-md;
+  }
+
+  .field-label {
+    @apply mb-1 block text-xs uppercase tracking-[0.16em] text-slate-300/80;
+  }
+
+  .field-input {
+    @apply w-full rounded-xl border border-white/20 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 outline-none transition;
+  }
+
+  .field-input:focus {
+    @apply border-ember-400 ring-2 ring-ember-400/30;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center rounded-xl px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .btn-primary {
+    @apply btn bg-ember-500 text-slate-950 hover:bg-ember-400;
+  }
+
+  .btn-secondary {
+    @apply btn border border-sea-400/50 bg-sea-500/10 text-sea-300 hover:bg-sea-500/20;
+  }
+
+  .btn-danger {
+    @apply btn border border-rose-300/40 bg-rose-400/15 text-rose-100 hover:bg-rose-400/30;
+  }
+
+  .progress-track {
+    @apply h-2 rounded-full bg-slate-700/70;
+  }
+
+  .progress-fill {
+    @apply h-full rounded-full bg-gradient-to-r from-ember-400 to-sea-400 transition-all duration-150;
+  }
+}
