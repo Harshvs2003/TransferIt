@@ -73,12 +73,11 @@ function App() {
   const [downloadMeta, setDownloadMeta] = useState("");
   const [transferState, setTransferState] = useState<TransferState>("idle");
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
-
-  const isChannelOpen = dataChannelRef.current?.readyState === "open";
+  const [dataChannelReady, setDataChannelReady] = useState(false);
 
   const canSendFile = useMemo(
-    () => Boolean(selectedFile && isChannelOpen && transferState !== "sending"),
-    [selectedFile, isChannelOpen, transferState],
+    () => Boolean(selectedFile && dataChannelReady && transferState !== "sending"),
+    [selectedFile, dataChannelReady, transferState],
   );
 
   function clearPingLoop() {
@@ -123,6 +122,7 @@ function App() {
     peerConnectionRef.current = null;
 
     remoteSocketIdRef.current = null;
+    setDataChannelReady(false);
     setConnectionStatus(serverConnectedRef.current && currentRoomIdRef.current ? "Waiting" : "Disconnected");
     setLatencyMs(null);
     clearPingLoop();
@@ -217,8 +217,10 @@ function App() {
   function setupDataChannel(channel: RTCDataChannel) {
     dataChannelRef.current = channel;
     channel.binaryType = "arraybuffer";
+    setDataChannelReady(false);
 
     channel.onopen = () => {
+      setDataChannelReady(true);
       setConnectionStatus("Connected");
       setErrorMessage("");
       setInfoMessage("Peer connection is ready. You can transfer files now.");
@@ -226,6 +228,7 @@ function App() {
     };
 
     channel.onclose = () => {
+      setDataChannelReady(false);
       setConnectionStatus(serverConnectedRef.current && currentRoomIdRef.current ? "Waiting" : "Disconnected");
       setInfoMessage("Data channel closed. Waiting for peer...");
       setLatencyMs(null);
@@ -233,6 +236,7 @@ function App() {
     };
 
     channel.onerror = () => {
+      setDataChannelReady(false);
       setTransferState("error");
       setErrorMessage("Data channel error occurred.");
     };
@@ -271,6 +275,16 @@ function App() {
       }
     };
 
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === "checking") {
+        setInfoMessage("Negotiating ICE candidates...");
+      }
+
+      if (pc.iceConnectionState === "failed") {
+        setErrorMessage("Peer connection failed. Retry or use a TURN server for restrictive networks.");
+      }
+    };
+
     pc.ondatachannel = (event) => {
       // The joining peer receives the channel created by the initiator.
       setupDataChannel(event.channel);
@@ -305,6 +319,12 @@ function App() {
   async function startTransfer(file: File) {
     const channel = dataChannelRef.current;
     if (!channel || channel.readyState !== "open") {
+      if (isHost && remoteSocketIdRef.current) {
+        setInfoMessage("Data channel is not ready yet. Retrying negotiation...");
+        setErrorMessage("");
+        await beginOffer(remoteSocketIdRef.current);
+        return;
+      }
       setErrorMessage("No active data channel. Connect to a peer first.");
       return;
     }
@@ -436,24 +456,34 @@ function App() {
     socket.on("offer", async ({ from, offer }: { from: string; offer: RTCSessionDescriptionInit }) => {
       if (!socketRef.current || !currentRoomIdRef.current) return;
 
-      const pc = createPeerConnection(from);
+      try {
+        setInfoMessage("Offer received. Sending answer...");
+        const pc = createPeerConnection(from);
 
-      // The receiver applies the remote offer, then creates and sends an answer.
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
+        // The receiver applies the remote offer, then creates and sends an answer.
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
 
-      socketRef.current.emit("answer", {
-        roomId: currentRoomIdRef.current,
-        target: from,
-        answer,
-      });
+        socketRef.current.emit("answer", {
+          roomId: currentRoomIdRef.current,
+          target: from,
+          answer,
+        });
+      } catch {
+        setErrorMessage("Failed to process incoming offer.");
+      }
     });
 
     socket.on("answer", async ({ answer }: { answer: RTCSessionDescriptionInit }) => {
       const pc = peerConnectionRef.current;
       if (!pc) return;
-      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      try {
+        setInfoMessage("Answer received. Finalizing peer connection...");
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      } catch {
+        setErrorMessage("Failed to apply peer answer.");
+      }
     });
 
     socket.on("ice-candidate", async ({ candidate }: { candidate: RTCIceCandidateInit }) => {
