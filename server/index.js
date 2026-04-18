@@ -367,6 +367,19 @@ io.on("connection", (socket) => {
         return;
       }
 
+      // If this same socket is already in the target room, treat it as a no-op join.
+      if (socket.data.roomId === roomId && room.members.includes(socket.id)) {
+        const peerId = getOtherMemberId(room, socket.id);
+        callback?.({
+          ok: true,
+          roomId,
+          peerId,
+          hostId: room.hostId,
+          requiresPassword: Boolean(room.password),
+        });
+        return;
+      }
+
       await removeSocketFromRoom(socket);
 
       const updatedRoom = await roomStore.addMember(roomId, socket.id);
