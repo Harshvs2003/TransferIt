@@ -399,9 +399,7 @@ function App() {
   }
 
   useEffect(() => {
-    const socket = io(SIGNALING_URL, {
-      transports: ["websocket"],
-    });
+    const socket = io(SIGNALING_URL);
 
     socketRef.current = socket;
 
