@@ -79,6 +79,7 @@ function App() {
   const currentRoomIdRef = useRef("");
   const serverConnectedRef = useRef(false);
   const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const uploadUiUpdateTsRef = useRef(0);
   const downloadUiUpdateTsRef = useRef(0);
   const uploadStartTsRef = useRef(0);
@@ -170,6 +171,7 @@ function App() {
     peerConnectionRef.current = null;
 
     remoteSocketIdRef.current = null;
+    pendingIceCandidatesRef.current = [];
     setDataChannelReady(false);
     setConnectionStatus(serverConnectedRef.current && currentRoomIdRef.current ? "Waiting" : "Disconnected");
     setLatencyMs(null);
@@ -377,6 +379,7 @@ function App() {
     const pc = new RTCPeerConnection(RTC_CONFIG);
     remoteSocketIdRef.current = remotePeerId;
     peerConnectionRef.current = pc;
+    pendingIceCandidatesRef.current = [];
 
     pc.onicecandidate = (event) => {
       if (!event.candidate || !socketRef.current || !currentRoomIdRef.current || !remoteSocketIdRef.current) {
@@ -415,6 +418,22 @@ function App() {
     };
 
     return pc;
+  }
+
+  async function flushPendingIceCandidates() {
+    const pc = peerConnectionRef.current;
+    if (!pc || !pc.remoteDescription) return;
+
+    while (pendingIceCandidatesRef.current.length > 0) {
+      const candidate = pendingIceCandidatesRef.current.shift();
+      if (!candidate) continue;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        setErrorMessage("Failed to add queued ICE candidate.");
+      }
+    }
   }
 
   async function beginOffer(remotePeerId: string) {
@@ -615,6 +634,7 @@ function App() {
         const pc = createPeerConnection(from);
 
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        await flushPendingIceCandidates();
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
 
@@ -634,6 +654,7 @@ function App() {
       try {
         setInfoMessage("Answer received. Finalizing peer connection...");
         await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        await flushPendingIceCandidates();
       } catch {
         setErrorMessage("Failed to apply peer answer.");
       }
@@ -644,6 +665,11 @@ function App() {
       if (!pc || !candidate) return;
 
       try {
+        if (!pc.remoteDescription) {
+          pendingIceCandidatesRef.current.push(candidate);
+          return;
+        }
+
         await pc.addIceCandidate(new RTCIceCandidate(candidate));
       } catch {
         setErrorMessage("Failed to add ICE candidate.");
