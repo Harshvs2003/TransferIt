@@ -1,6 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+﻿import { useEffect, useMemo, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
-import { CHUNK_SIZE, RTC_CONFIG, waitForBufferedAmountLow } from "./lib/webrtc";
+import { clearTransferChunks, getTransferBlob, storeChunk } from "./lib/transferStore";
+import {
+  getProfileConfig,
+  makeChunkPacket,
+  parseChunkPacket,
+  RTC_CONFIG,
+  waitForBufferedAmountLow,
+} from "./lib/webrtc";
+import type { TransferProfile } from "./lib/webrtc";
 import { formatBytes, generateRoomCode } from "./lib/format";
 
 type ConnectionStatus = "Disconnected" | "Waiting" | "Connected";
@@ -14,8 +22,22 @@ type ControlMessage =
       size: number;
       chunkSize: number;
       totalChunks: number;
+      startChunk: number;
+      startBytes: number;
+      reset: boolean;
+      profile: TransferProfile;
     }
-  | { type: "file-end"; transferId: string }
+  | {
+      type: "file-end";
+      transferId: string;
+      totalChunks: number;
+    }
+  | {
+      type: "transfer-ack";
+      transferId: string;
+      receivedChunks: number;
+      receivedBytes: number;
+    }
   | { type: "cancel-transfer"; transferId?: string }
   | { type: "ping"; ts: number }
   | { type: "pong"; ts: number };
@@ -26,6 +48,7 @@ interface IncomingFile {
   size: number;
   chunkSize: number;
   totalChunks: number;
+  expectedNextChunk: number;
 }
 
 interface SignalingAck {
@@ -49,13 +72,19 @@ function App() {
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
   const remoteSocketIdRef = useRef<string | null>(null);
   const incomingFileRef = useRef<IncomingFile | null>(null);
-  const receivedChunksRef = useRef<ArrayBuffer[]>([]);
   const receivedBytesRef = useRef(0);
   const activeOutgoingTransferIdRef = useRef<string | null>(null);
   const cancelTransferRef = useRef(false);
   const pingIntervalRef = useRef<number | null>(null);
   const currentRoomIdRef = useRef("");
   const serverConnectedRef = useRef(false);
+  const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const uploadUiUpdateTsRef = useRef(0);
+  const downloadUiUpdateTsRef = useRef(0);
+  const uploadStartTsRef = useRef(0);
+  const downloadStartTsRef = useRef(0);
+  const lastAckedChunkRef = useRef(0);
+  const lastAckedBytesRef = useRef(0);
 
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("Disconnected");
   const [serverConnected, setServerConnected] = useState(false);
@@ -74,6 +103,11 @@ function App() {
   const [transferState, setTransferState] = useState<TransferState>("idle");
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [dataChannelReady, setDataChannelReady] = useState(false);
+  const [transferProfile, setTransferProfile] = useState<TransferProfile>("internet");
+  const [uploadRate, setUploadRate] = useState(0);
+  const [downloadRate, setDownloadRate] = useState(0);
+
+  const profileConfig = useMemo(() => getProfileConfig(transferProfile), [transferProfile]);
 
   const canSendFile = useMemo(
     () => Boolean(selectedFile && dataChannelReady && transferState !== "sending"),
@@ -99,19 +133,33 @@ function App() {
     }, 4000);
   }
 
-  function resetIncomingTransfer() {
+  async function resetIncomingTransfer(clearChunks = true) {
+    const incoming = incomingFileRef.current;
     incomingFileRef.current = null;
-    receivedChunksRef.current = [];
     receivedBytesRef.current = 0;
+    downloadStartTsRef.current = 0;
     setDownloadProgress(0);
     setDownloadMeta("");
+    setDownloadRate(0);
+
+    if (clearChunks && incoming?.transferId) {
+      try {
+        await clearTransferChunks(incoming.transferId);
+      } catch {
+        // ignore
+      }
+    }
   }
 
   function resetOutgoingTransfer() {
     activeOutgoingTransferIdRef.current = null;
     cancelTransferRef.current = false;
+    uploadStartTsRef.current = 0;
+    lastAckedChunkRef.current = 0;
+    lastAckedBytesRef.current = 0;
     setUploadProgress(0);
     setUploadMeta("");
+    setUploadRate(0);
   }
 
   function closePeerConnection() {
@@ -134,14 +182,52 @@ function App() {
     channel.send(JSON.stringify(message));
   }
 
-  function triggerDownload(name: string, chunks: ArrayBuffer[]) {
-    const fileBlob = new Blob(chunks);
+  function triggerDownload(name: string, fileBlob: Blob) {
     const objectUrl = URL.createObjectURL(fileBlob);
     const anchor = document.createElement("a");
     anchor.href = objectUrl;
     anchor.download = name;
     anchor.click();
     URL.revokeObjectURL(objectUrl);
+  }
+
+  function throttledUploadProgress(bytesSent: number, fileSize: number) {
+    const now = performance.now();
+    if (now - uploadUiUpdateTsRef.current < profileConfig.uiUpdateIntervalMs && bytesSent < fileSize) {
+      return;
+    }
+    uploadUiUpdateTsRef.current = now;
+    setUploadProgress(Math.min(100, (bytesSent / fileSize) * 100));
+    if (uploadStartTsRef.current > 0) {
+      const elapsedSec = Math.max(0.001, (now - uploadStartTsRef.current) / 1000);
+      setUploadRate(bytesSent / elapsedSec / (1024 * 1024));
+    }
+  }
+
+  function throttledDownloadProgress(bytesReceived: number, fileSize: number) {
+    const now = performance.now();
+    if (now - downloadUiUpdateTsRef.current < profileConfig.uiUpdateIntervalMs && bytesReceived < fileSize) {
+      return;
+    }
+    downloadUiUpdateTsRef.current = now;
+    setDownloadProgress(Math.min(100, (bytesReceived / fileSize) * 100));
+    if (downloadStartTsRef.current > 0) {
+      const elapsedSec = Math.max(0.001, (now - downloadStartTsRef.current) / 1000);
+      setDownloadRate(bytesReceived / elapsedSec / (1024 * 1024));
+    }
+  }
+
+  function maybeSendAck(fileMeta: IncomingFile, force = false) {
+    if (!force && fileMeta.expectedNextChunk % profileConfig.ackEveryChunks !== 0) {
+      return;
+    }
+
+    sendControlMessage({
+      type: "transfer-ack",
+      transferId: fileMeta.transferId,
+      receivedChunks: fileMeta.expectedNextChunk,
+      receivedBytes: receivedBytesRef.current,
+    });
   }
 
   async function handleDataMessage(rawData: string | ArrayBuffer | Blob) {
@@ -163,27 +249,42 @@ function App() {
         return;
       }
 
+      if (control.type === "transfer-ack") {
+        if (control.transferId === activeOutgoingTransferIdRef.current) {
+          lastAckedChunkRef.current = Math.max(lastAckedChunkRef.current, control.receivedChunks);
+          lastAckedBytesRef.current = Math.max(lastAckedBytesRef.current, control.receivedBytes);
+        }
+        return;
+      }
+
       if (control.type === "cancel-transfer") {
-        resetIncomingTransfer();
+        await resetIncomingTransfer(true);
         setTransferState("cancelled");
         setInfoMessage("Transfer cancelled by peer.");
         return;
       }
 
       if (control.type === "file-meta") {
+        if (control.reset) {
+          await clearTransferChunks(control.transferId);
+        }
+
         incomingFileRef.current = {
           transferId: control.transferId,
           name: control.name,
           size: control.size,
           chunkSize: control.chunkSize,
           totalChunks: control.totalChunks,
+          expectedNextChunk: control.startChunk,
         };
 
-        receivedChunksRef.current = [];
-        receivedBytesRef.current = 0;
+        receivedBytesRef.current = control.startBytes;
+        downloadStartTsRef.current = performance.now();
         setTransferState("receiving");
-        setDownloadProgress(0);
+        throttledDownloadProgress(receivedBytesRef.current, control.size);
         setDownloadMeta(`${control.name} (${formatBytes(control.size)})`);
+        setInfoMessage(control.startChunk > 0 ? "Resuming incoming transfer..." : "Receiving file...");
+        maybeSendAck(incomingFileRef.current, true);
         return;
       }
 
@@ -193,30 +294,54 @@ function App() {
           return;
         }
 
-        triggerDownload(fileMeta.name, receivedChunksRef.current);
-        setDownloadProgress(100);
-        setTransferState("completed");
-        setInfoMessage(`Download complete: ${fileMeta.name}`);
-        resetIncomingTransfer();
+        await writeQueueRef.current;
+        maybeSendAck(fileMeta, true);
+
+        try {
+          const blob = await getTransferBlob(fileMeta.transferId, control.totalChunks);
+          triggerDownload(fileMeta.name, blob);
+          setDownloadProgress(100);
+          setTransferState("completed");
+          setInfoMessage(`Download complete: ${fileMeta.name}`);
+        } catch {
+          setTransferState("error");
+          setErrorMessage("Download reconstruction failed. Try retrying the transfer.");
+        } finally {
+          await clearTransferChunks(fileMeta.transferId);
+          incomingFileRef.current = null;
+        }
       }
 
       return;
     }
 
-    const chunkBuffer = rawData instanceof Blob ? await rawData.arrayBuffer() : rawData;
+    const packet = rawData instanceof Blob ? await rawData.arrayBuffer() : rawData;
     const fileMeta = incomingFileRef.current;
     if (!fileMeta) return;
 
-    receivedChunksRef.current.push(chunkBuffer);
-    receivedBytesRef.current += chunkBuffer.byteLength;
+    const { index, payload } = parseChunkPacket(packet);
 
-    const nextProgress = Math.min(100, (receivedBytesRef.current / fileMeta.size) * 100);
-    setDownloadProgress(nextProgress);
+    if (index < fileMeta.expectedNextChunk) {
+      return;
+    }
+
+    if (index > fileMeta.expectedNextChunk) {
+      setErrorMessage("Chunk sequence mismatch. Please retry transfer.");
+      return;
+    }
+
+    writeQueueRef.current = writeQueueRef.current.then(() => storeChunk(fileMeta.transferId, index, payload));
+
+    fileMeta.expectedNextChunk += 1;
+    receivedBytesRef.current += payload.byteLength;
+    throttledDownloadProgress(receivedBytesRef.current, fileMeta.size);
+    maybeSendAck(fileMeta);
   }
 
   function setupDataChannel(channel: RTCDataChannel) {
     dataChannelRef.current = channel;
     channel.binaryType = "arraybuffer";
+    channel.bufferedAmountLowThreshold = profileConfig.bufferedAmountLimit;
     setDataChannelReady(false);
 
     channel.onopen = () => {
@@ -286,7 +411,6 @@ function App() {
     };
 
     pc.ondatachannel = (event) => {
-      // The joining peer receives the channel created by the initiator.
       setupDataChannel(event.channel);
     };
 
@@ -299,7 +423,6 @@ function App() {
 
     const pc = createPeerConnection(remotePeerId);
 
-    // The initiator creates a reliable ordered channel for chunk delivery.
     const outgoingChannel = pc.createDataChannel("file-transfer", { ordered: true });
     setupDataChannel(outgoingChannel);
 
@@ -316,7 +439,13 @@ function App() {
     setInfoMessage("Offer created. Waiting for peer answer...");
   }
 
-  async function startTransfer(file: File) {
+  async function readChunk(file: File, index: number, chunkSize: number): Promise<ArrayBuffer> {
+    const start = index * chunkSize;
+    const chunk = file.slice(start, start + chunkSize);
+    return chunk.arrayBuffer();
+  }
+
+  async function startTransfer(file: File, resume = false) {
     const channel = dataChannelRef.current;
     if (!channel || channel.readyState !== "open") {
       if (isHost && remoteSocketIdRef.current) {
@@ -331,28 +460,48 @@ function App() {
 
     cancelTransferRef.current = false;
     setTransferState("sending");
-    setUploadProgress(0);
+    uploadStartTsRef.current = performance.now();
+    uploadUiUpdateTsRef.current = 0;
+    setUploadRate(0);
 
-    const transferId = crypto.randomUUID?.() || `tx-${Date.now()}`;
+    const chunkSize = profileConfig.chunkSize;
+    const totalChunks = Math.ceil(file.size / chunkSize);
+
+    const transferId = resume && activeOutgoingTransferIdRef.current
+      ? activeOutgoingTransferIdRef.current
+      : crypto.randomUUID?.() || `tx-${Date.now()}`;
+
     activeOutgoingTransferIdRef.current = transferId;
 
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const startChunk = resume ? lastAckedChunkRef.current : 0;
+    const startBytes = resume ? lastAckedBytesRef.current : 0;
+
+    if (!resume) {
+      lastAckedChunkRef.current = 0;
+      lastAckedBytesRef.current = 0;
+    }
 
     sendControlMessage({
       type: "file-meta",
       transferId,
       name: file.name,
       size: file.size,
-      chunkSize: CHUNK_SIZE,
+      chunkSize,
       totalChunks,
+      startChunk,
+      startBytes,
+      reset: !resume,
+      profile: transferProfile,
     });
 
-    setUploadMeta(`${file.name} (${formatBytes(file.size)})`);
+    setUploadMeta(`${file.name} (${formatBytes(file.size)}) | ${transferProfile.toUpperCase()} profile`);
 
-    let sentBytes = 0;
+    let sentBytes = startBytes;
 
     try {
-      for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
+      let preloaded = await readChunk(file, startChunk, chunkSize);
+
+      for (let chunkIndex = startChunk; chunkIndex < totalChunks; chunkIndex += 1) {
         if (cancelTransferRef.current) {
           sendControlMessage({ type: "cancel-transfer", transferId });
           setTransferState("cancelled");
@@ -360,22 +509,27 @@ function App() {
           return;
         }
 
-        const chunk = file.slice(offset, offset + CHUNK_SIZE);
-        const chunkBuffer = await chunk.arrayBuffer();
+        const hasNext = chunkIndex + 1 < totalChunks;
+        const nextPromise = hasNext ? readChunk(file, chunkIndex + 1, chunkSize) : null;
 
-        await waitForBufferedAmountLow(channel);
+        await waitForBufferedAmountLow(channel, profileConfig.bufferedAmountLimit);
 
         if (channel.readyState !== "open") {
           throw new Error("Data channel closed while sending.");
         }
 
-        channel.send(chunkBuffer);
+        channel.send(makeChunkPacket(chunkIndex, preloaded));
+        sentBytes += preloaded.byteLength;
+        throttledUploadProgress(sentBytes, file.size);
 
-        sentBytes += chunkBuffer.byteLength;
-        setUploadProgress(Math.min(100, (sentBytes / file.size) * 100));
+        if (hasNext && nextPromise) {
+          // eslint-disable-next-line no-await-in-loop
+          preloaded = await nextPromise;
+        }
       }
 
-      sendControlMessage({ type: "file-end", transferId });
+      sendControlMessage({ type: "file-end", transferId, totalChunks });
+      setUploadProgress(100);
       setTransferState("completed");
       setInfoMessage(`Upload complete: ${file.name}`);
     } catch {
@@ -385,7 +539,7 @@ function App() {
   }
 
   function leaveRoom() {
-    socketRef.current?.emit("leave-room", () => {
+    socketRef.current?.emit("leave-room", async () => {
       closePeerConnection();
       setCurrentRoomId("");
       currentRoomIdRef.current = "";
@@ -393,7 +547,7 @@ function App() {
       setIsHost(false);
       setTransferState("idle");
       setSelectedFile(null);
-      resetIncomingTransfer();
+      await resetIncomingTransfer(true);
       resetOutgoingTransfer();
       setInfoMessage("You left the room.");
     });
@@ -413,7 +567,7 @@ function App() {
 
     if (transferState === "receiving") {
       sendControlMessage({ type: "cancel-transfer" });
-      resetIncomingTransfer();
+      void resetIncomingTransfer(true);
       setTransferState("cancelled");
       setInfoMessage("Incoming transfer cancelled.");
     }
@@ -421,7 +575,7 @@ function App() {
 
   function retryTransfer() {
     if (!selectedFile) return;
-    void startTransfer(selectedFile);
+    void startTransfer(selectedFile, true);
   }
 
   useEffect(() => {
@@ -460,7 +614,6 @@ function App() {
         setInfoMessage("Offer received. Sending answer...");
         const pc = createPeerConnection(from);
 
-        // The receiver applies the remote offer, then creates and sends an answer.
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
@@ -647,9 +800,27 @@ function App() {
 
         <article className="panel">
           <h2 className="text-xl font-bold text-white">File Transfer</h2>
-          <p className="mt-1 text-sm text-slate-300">Chunk size: {formatBytes(CHUNK_SIZE)}. Files are sent directly peer-to-peer.</p>
+          <p className="mt-1 text-sm text-slate-300">
+            Chunk size: {formatBytes(profileConfig.chunkSize)} | Buffer: {formatBytes(profileConfig.bufferedAmountLimit)}
+          </p>
 
           <div className="mt-4 space-y-4">
+            <div>
+              <label className="field-label" htmlFor="transfer-profile">
+                Transfer Profile
+              </label>
+              <select
+                id="transfer-profile"
+                className="field-input"
+                value={transferProfile}
+                onChange={(event) => setTransferProfile(event.target.value as TransferProfile)}
+                disabled={transferState === "sending" || transferState === "receiving"}
+              >
+                <option value="internet">Internet (stable)</option>
+                <option value="lan">LAN (maximum speed)</option>
+              </select>
+            </div>
+
             <div>
               <label className="field-label" htmlFor="file-input">
                 Select File
@@ -669,7 +840,7 @@ function App() {
             </div>
 
             <div className="flex flex-wrap gap-2">
-              <button className="btn-primary" disabled={!canSendFile} onClick={() => selectedFile && void startTransfer(selectedFile)}>
+              <button className="btn-primary" disabled={!canSendFile} onClick={() => selectedFile && void startTransfer(selectedFile, false)}>
                 Send File
               </button>
               <button
@@ -680,7 +851,7 @@ function App() {
                 Cancel
               </button>
               <button className="btn-secondary" onClick={retryTransfer} disabled={!selectedFile || transferState === "sending"}>
-                Retry
+                Resume/Retry
               </button>
             </div>
           </div>
@@ -695,6 +866,7 @@ function App() {
                 <div className="progress-fill" style={{ width: `${uploadProgress}%` }} />
               </div>
               <p className="mt-1 text-xs text-slate-300">{uploadMeta || "No upload yet."}</p>
+              <p className="mt-1 text-xs text-sea-300">Throughput: {uploadRate.toFixed(2)} MB/s</p>
             </div>
 
             <div>
@@ -706,6 +878,7 @@ function App() {
                 <div className="progress-fill" style={{ width: `${downloadProgress}%` }} />
               </div>
               <p className="mt-1 text-xs text-slate-300">{downloadMeta || "No download yet."}</p>
+              <p className="mt-1 text-xs text-sea-300">Throughput: {downloadRate.toFixed(2)} MB/s</p>
             </div>
 
             <div className="rounded-xl border border-white/10 bg-slate-950/50 p-3 text-xs uppercase tracking-[0.14em] text-slate-300">

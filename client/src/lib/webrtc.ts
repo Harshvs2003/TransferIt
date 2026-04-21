@@ -1,5 +1,28 @@
-export const CHUNK_SIZE = 64 * 1024;
-export const BUFFERED_AMOUNT_LIMIT = CHUNK_SIZE * 8;
+export type TransferProfile = "internet" | "lan";
+
+interface ProfileConfig {
+  chunkSize: number;
+  bufferedAmountLimit: number;
+  ackEveryChunks: number;
+  uiUpdateIntervalMs: number;
+}
+
+const KB = 1024;
+
+export const PROFILE_CONFIG: Record<TransferProfile, ProfileConfig> = {
+  internet: {
+    chunkSize: 256 * KB,
+    bufferedAmountLimit: 2 * 1024 * KB,
+    ackEveryChunks: 32,
+    uiUpdateIntervalMs: 150,
+  },
+  lan: {
+    chunkSize: 512 * KB,
+    bufferedAmountLimit: 8 * 1024 * KB,
+    ackEveryChunks: 64,
+    uiUpdateIntervalMs: 100,
+  },
+};
 
 export const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
@@ -8,26 +31,40 @@ export const RTC_CONFIG: RTCConfiguration = {
   ],
 };
 
-export function waitForBufferedAmountLow(channel: RTCDataChannel): Promise<void> {
-  if (channel.bufferedAmount <= BUFFERED_AMOUNT_LIMIT) {
+export function getProfileConfig(profile: TransferProfile): ProfileConfig {
+  return PROFILE_CONFIG[profile];
+}
+
+export function makeChunkPacket(index: number, payload: ArrayBuffer): ArrayBuffer {
+  const header = new ArrayBuffer(4);
+  new DataView(header).setUint32(0, index, false);
+
+  const merged = new Uint8Array(4 + payload.byteLength);
+  merged.set(new Uint8Array(header), 0);
+  merged.set(new Uint8Array(payload), 4);
+  return merged.buffer;
+}
+
+export function parseChunkPacket(packet: ArrayBuffer): { index: number; payload: ArrayBuffer } {
+  const view = new DataView(packet);
+  const index = view.getUint32(0, false);
+  const payload = packet.slice(4);
+  return { index, payload };
+}
+
+export function waitForBufferedAmountLow(channel: RTCDataChannel, threshold: number): Promise<void> {
+  channel.bufferedAmountLowThreshold = threshold;
+
+  if (channel.bufferedAmount <= threshold) {
     return Promise.resolve();
   }
 
   return new Promise((resolve) => {
-    const check = () => {
-      if (channel.readyState !== "open") {
-        resolve();
-        return;
-      }
-
-      if (channel.bufferedAmount <= BUFFERED_AMOUNT_LIMIT) {
-        resolve();
-        return;
-      }
-
-      setTimeout(check, 20);
+    const onLow = () => {
+      channel.removeEventListener("bufferedamountlow", onLow);
+      resolve();
     };
 
-    check();
+    channel.addEventListener("bufferedamountlow", onLow);
   });
 }
